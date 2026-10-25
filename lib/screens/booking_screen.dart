@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter_easyloading/flutter_easyloading.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:table_calendar/table_calendar.dart';
 
+import '../models/barber_model.dart';
+import '../models/hairstyle_model.dart';
 import '../models/service_model.dart';
 import '../theme/app_theme.dart';
 
@@ -20,6 +23,8 @@ class _BookingScreenState extends State<BookingScreen> {
   DateTime _focusedDay = DateTime.now();
   DateTime? _selectedDay;
   String? _selectedTime;
+  String _selectedBarberId = sampleBarbers.first.id;
+  String? _selectedHairstyleId; // không bắt buộc, bấm lần nữa để bỏ chọn
   String? _selectedServiceId = '1';
   String _paymentMethod = 'MOMO';
   Set<String> _bookedSlots = {};
@@ -52,14 +57,22 @@ class _BookingScreenState extends State<BookingScreen> {
     return slot.isBefore(DateTime.now());
   }
 
+  // Tải các giờ đã có người đặt của thợ đang chọn trong ngày
   Future<void> _loadBookedSlots(DateTime day) async {
+    final barberId = _selectedBarberId;
     try {
       final data = await _client
           .from('bookings')
           .select('booking_time')
           .eq('booking_date', _dateToDb(day))
+          .eq('barber_id', barberId)
           .neq('status', 'cancelled'); // lịch đã hủy thì giờ đó trống lại
-      if (!mounted) return;
+      // Nếu trong lúc chờ người dùng đã đổi thợ hoặc đổi ngày thì bỏ kết quả này
+      if (!mounted ||
+          _selectedBarberId != barberId ||
+          !isSameDay(_selectedDay, day)) {
+        return;
+      }
       setState(() {
         _bookedSlots =
             data.map<String>((row) => row['booking_time'] as String).toSet();
@@ -67,6 +80,16 @@ class _BookingScreenState extends State<BookingScreen> {
     } catch (_) {
       EasyLoading.showError('Không tải được các khung giờ đã đặt.');
     }
+  }
+
+  void _selectBarber(Barber barber) {
+    if (_selectedBarberId == barber.id) return;
+    setState(() {
+      _selectedBarberId = barber.id;
+      _selectedTime = null;
+      _bookedSlots = {};
+    });
+    if (_selectedDay != null) _loadBookedSlots(_selectedDay!);
   }
 
   Future<void> _confirmBooking() async {
@@ -81,6 +104,14 @@ class _BookingScreenState extends State<BookingScreen> {
       (item) => item.id == _selectedServiceId,
       orElse: () => sampleServices.first,
     );
+    final barber = sampleBarbers.firstWhere(
+      (item) => item.id == _selectedBarberId,
+      orElse: () => sampleBarbers.first,
+    );
+    Hairstyle? hairstyle;
+    for (final style in sampleHairstyles) {
+      if (style.id == _selectedHairstyleId) hairstyle = style;
+    }
     final day = _selectedDay!;
     final time = _selectedTime!;
     final date = '${day.day.toString().padLeft(2, '0')}/'
@@ -96,6 +127,9 @@ class _BookingScreenState extends State<BookingScreen> {
       await _client.from('bookings').insert({
         'booking_date': _dateToDb(day),
         'booking_time': time,
+        'barber_id': barber.id,
+        'barber_name': barber.name,
+        'hairstyle_name': hairstyle?.name,
         'service_id': service.id,
         'service_name': service.name,
         'price': service.price,
@@ -113,7 +147,9 @@ class _BookingScreenState extends State<BookingScreen> {
         builder: (dialogContext) => AlertDialog(
           title: const Text('Đặt lịch thành công'),
           content: Text(
-            'Ngày: $date\nGiờ: $time\nDịch vụ: ${service.name}\n'
+            'Ngày: $date\nGiờ: $time\nThợ: ${barber.name}\n'
+            'Kiểu tóc: ${hairstyle?.name ?? 'Tư vấn tại salon'}\n'
+            'Dịch vụ: ${service.name}\n'
             'Giá: ${_formatPrice(service.price)} đ\nThanh toán: $paymentLabel\n\n'
             'Lịch hẹn đã được lưu, bạn xem và hủy lịch trong mục Tài khoản. '
             'Phần thanh toán MoMo/VNPay chỉ là demo, chưa có giao dịch thật.',
@@ -127,7 +163,7 @@ class _BookingScreenState extends State<BookingScreen> {
         ),
       );
     } on PostgrestException catch (e) {
-      // 23505 = vi phạm unique, tức là có người vừa đặt khung giờ này
+      // 23505 = vi phạm unique, tức là thợ này vừa có người đặt khung giờ đó
       if (e.code == '23505') {
         EasyLoading.showError('Khung giờ này vừa có người đặt, hãy chọn giờ khác.');
         await _loadBookedSlots(day);
@@ -161,7 +197,19 @@ class _BookingScreenState extends State<BookingScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _sectionTitle('1. Chọn ngày cắt tóc'),
+            _sectionTitle('1. Chọn thợ cắt tóc'),
+            const SizedBox(height: 10),
+            SizedBox(
+              height: 180,
+              child: ListView.builder(
+                scrollDirection: Axis.horizontal,
+                itemCount: sampleBarbers.length,
+                itemBuilder: (context, index) =>
+                    _barberCard(sampleBarbers[index]),
+              ),
+            ),
+            const SizedBox(height: 16),
+            _sectionTitle('2. Chọn ngày cắt tóc'),
             const SizedBox(height: 8),
             Container(
               decoration: BoxDecoration(
@@ -214,7 +262,7 @@ class _BookingScreenState extends State<BookingScreen> {
               ),
             ).animate().fadeIn(),
             const SizedBox(height: 20),
-            _sectionTitle('2. Chọn khung giờ trống'),
+            _sectionTitle('3. Chọn khung giờ trống'),
             const SizedBox(height: 10),
             Wrap(
               spacing: 10,
@@ -239,7 +287,19 @@ class _BookingScreenState extends State<BookingScreen> {
               }).toList(),
             ),
             const SizedBox(height: 24),
-            _sectionTitle('3. Chọn gói dịch vụ'),
+            _sectionTitle('4. Chọn kiểu tóc (không bắt buộc)'),
+            const SizedBox(height: 10),
+            SizedBox(
+              height: 160,
+              child: ListView.builder(
+                scrollDirection: Axis.horizontal,
+                itemCount: sampleHairstyles.length,
+                itemBuilder: (context, index) =>
+                    _hairstyleCard(sampleHairstyles[index]),
+              ),
+            ),
+            const SizedBox(height: 24),
+            _sectionTitle('5. Chọn gói dịch vụ'),
             const SizedBox(height: 10),
             ...sampleServices.map((service) {
               final isSelected = _selectedServiceId == service.id;
@@ -274,7 +334,7 @@ class _BookingScreenState extends State<BookingScreen> {
               );
             }),
             const SizedBox(height: 16),
-            _sectionTitle('4. Phương thức thanh toán'),
+            _sectionTitle('6. Phương thức thanh toán'),
             const SizedBox(height: 8),
             Wrap(
               spacing: 8,
@@ -295,6 +355,118 @@ class _BookingScreenState extends State<BookingScreen> {
                 ),
                 onPressed: _confirmBooking,
                 child: Text('XÁC NHẬN (${_formatPrice(selectedService.price)} Đ)'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _barberCard(Barber barber) {
+    final isSelected = _selectedBarberId == barber.id;
+    return GestureDetector(
+      onTap: () => _selectBarber(barber),
+      child: Container(
+        width: 150,
+        margin: const EdgeInsets.only(right: 12),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: AppColors.card(context),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: isSelected ? AppColors.title(context) : Colors.transparent,
+            width: 2,
+          ),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircleAvatar(
+              radius: 32,
+              backgroundColor: Colors.brown.shade200,
+              backgroundImage: CachedNetworkImageProvider(barber.avatarUrl),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              barber.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            Text(
+              barber.role,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 12, color: AppColors.muted(context)),
+            ),
+            const SizedBox(height: 4),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.star, size: 14, color: Colors.amber),
+                const SizedBox(width: 4),
+                Text(barber.rating.toString(),
+                    style: const TextStyle(fontSize: 12)),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _hairstyleCard(Hairstyle style) {
+    final isSelected = _selectedHairstyleId == style.id;
+    return GestureDetector(
+      // bấm vào kiểu đang chọn thì bỏ chọn
+      onTap: () => setState(
+          () => _selectedHairstyleId = isSelected ? null : style.id),
+      child: Container(
+        width: 120,
+        margin: const EdgeInsets.only(right: 12),
+        clipBehavior: Clip.antiAlias,
+        decoration: BoxDecoration(
+          color: AppColors.card(context),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: isSelected ? AppColors.title(context) : Colors.transparent,
+            width: 2,
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: SizedBox(
+                width: double.infinity,
+                child: CachedNetworkImage(
+                  imageUrl: style.imageUrl,
+                  fit: BoxFit.cover,
+                  placeholder: (context, url) =>
+                      Container(color: AppColors.shimmerBase(context)),
+                  errorWidget: (context, url, error) =>
+                      const Icon(Icons.broken_image),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      style.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontSize: 12, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  if (isSelected)
+                    Icon(Icons.check_circle,
+                        size: 16, color: AppColors.title(context)),
+                ],
               ),
             ),
           ],

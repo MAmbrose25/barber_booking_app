@@ -22,10 +22,37 @@ class _ProfileScreenState extends State<ProfileScreen> {
   List<Map<String, dynamic>> _bookings = [];
   bool _loadingBookings = true;
 
+  String _fullName = '';
+  String _email = '';
+
   @override
   void initState() {
     super.initState();
+    final user = _client.auth.currentUser;
+    _email = user?.email ?? '';
+    // Hiện tạm tên lấy lúc đăng ký, rồi _loadProfile sẽ lấy tên trong bảng profiles
+    _fullName = (user?.userMetadata?['full_name'] as String?)?.trim() ?? '';
+    if (_fullName.isEmpty) _fullName = _email.split('@').first;
+    _loadProfile();
     _loadBookings();
+  }
+
+  // Lấy họ tên từ bảng profiles
+  Future<void> _loadProfile() async {
+    final user = _client.auth.currentUser;
+    if (user == null) return;
+    try {
+      final data = await _client
+          .from('profiles')
+          .select('full_name')
+          .eq('id', user.id)
+          .maybeSingle();
+      final name = (data?['full_name'] as String?)?.trim() ?? '';
+      if (!mounted || name.isEmpty) return;
+      setState(() => _fullName = name);
+    } catch (_) {
+      // Không lấy được thì giữ tên tạm, không cần báo lỗi
+    }
   }
 
   // Lấy lịch hẹn của người đang đăng nhập, mới nhất lên đầu
@@ -51,6 +78,37 @@ class _ProfileScreenState extends State<ProfileScreen> {
       if (!mounted) return;
       setState(() => _loadingBookings = false);
       EasyLoading.showError('Không tải được lịch sử đặt lịch.');
+    }
+  }
+
+  // Đăng xuất, main.dart sẽ tự chuyển về màn đăng nhập
+  Future<void> _signOut() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Đăng xuất?'),
+        content: const Text('Bạn có chắc muốn đăng xuất khỏi tài khoản này?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Ở lại'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Đăng xuất',
+                style: TextStyle(color: Colors.redAccent)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    EasyLoading.show(status: 'Đang đăng xuất...');
+    try {
+      await _client.auth.signOut();
+      EasyLoading.dismiss();
+    } catch (_) {
+      EasyLoading.showError('Không đăng xuất được, vui lòng thử lại.');
     }
   }
 
@@ -169,6 +227,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Số lịch đã đặt, không tính lịch đã hủy
+    final bookedCount =
+        _bookings.where((b) => b['status'] != 'cancelled').length;
+    final initial =
+        _fullName.isNotEmpty ? _fullName.substring(0, 1).toUpperCase() : '?';
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('TÀI KHOẢN & CHI NHÁNH',
@@ -184,25 +248,42 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   CircleAvatar(
                     radius: 36,
                     backgroundColor: AppColors.button(context),
-                    child: const Icon(Icons.person,
-                        size: 42, color: Colors.amberAccent),
+                    child: Text(
+                      initial,
+                      style: const TextStyle(
+                        fontSize: 30,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.amberAccent,
+                      ),
+                    ),
                   ),
                   const SizedBox(width: 16),
-                  // Cả Column này cố định nên đặt const ở đây, các con bên trong không cần const nữa
-                  const Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('Khách hàng VIP',
-                          style: TextStyle(
-                              fontSize: 17, fontWeight: FontWeight.bold)),
-                      SizedBox(height: 4),
-                      Text('0901 234 567',
-                          style: TextStyle(color: Colors.grey)),
-                      SizedBox(height: 6),
-                      Text('Hạng: Gold Member ⭐',
-                          style: TextStyle(
-                              color: Colors.deepOrange, fontSize: 12)),
-                    ],
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          _fullName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontSize: 17, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          _email,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(color: AppColors.muted(context)),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          'Đã đặt $bookedCount lịch',
+                          style: const TextStyle(
+                              color: Colors.deepOrange, fontSize: 12),
+                        ),
+                      ],
+                    ),
                   ),
                 ],
               ),
@@ -286,6 +367,21 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 ],
               ),
             ),
+            const SizedBox(height: 18),
+            SizedBox(
+              width: double.infinity,
+              height: 48,
+              child: OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.redAccent,
+                  side: const BorderSide(color: Colors.redAccent),
+                ),
+                onPressed: _signOut,
+                icon: const Icon(Icons.logout),
+                label: const Text('ĐĂNG XUẤT'),
+              ),
+            ),
+            const SizedBox(height: 8),
           ],
         ),
       ),
@@ -313,6 +409,17 @@ class _ProfileScreenState extends State<ProfileScreen> {
       statusText = 'Hoàn thành';
     }
 
+    // Ghép các dòng mô tả, dòng nào không có dữ liệu thì bỏ qua
+    final barberName = booking['barber_name'] as String?;
+    final hairstyleName = booking['hairstyle_name'] as String?;
+    final lines = <String>[
+      '${_formatDate(booking['booking_date'])} • ${booking['booking_time']}',
+      if (barberName != null && barberName.isNotEmpty) 'Thợ: $barberName',
+      if (hairstyleName != null && hairstyleName.isNotEmpty)
+        'Kiểu tóc: $hairstyleName',
+      '${_formatPrice(booking['price'] as int)} đ • $statusText',
+    ];
+
     return Column(
       children: [
         ListTile(
@@ -328,10 +435,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
               decoration: cancelled ? TextDecoration.lineThrough : null,
             ),
           ),
-          subtitle: Text(
-            '${_formatDate(booking['booking_date'])} • ${booking['booking_time']}\n'
-            '${_formatPrice(booking['price'] as int)} đ • $statusText',
-          ),
+          subtitle: Text(lines.join('\n')),
           trailing: _canCancel(booking)
               ? TextButton(
                   onPressed: () => _cancelBooking(booking),
