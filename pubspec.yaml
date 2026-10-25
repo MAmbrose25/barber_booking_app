@@ -1,0 +1,47 @@
+name: barber_booking_app
+description: "A barber booking application."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.0.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # Chủ đề 1: Hiệu ứng & UI
+  convex_bottom_bar: ^3.2.0
+  flutter_easyloading: ^3.0.5
+  shimmer: ^3.0.0
+  flutter_animate: ^4.5.2
+
+  # Chủ đề 2: Slider & Chọn ngày
+  table_calendar: ^3.1.2
+  carousel_slider: ^5.0.0
+
+  # Chủ đề 3: Hiển thị ảnh
+  cached_network_image: ^3.4.1
+
+  # Chủ đề 5: Tương tác hệ thống (Gọi hotline)
+  url_launcher: ^6.3.1
+
+  # Chủ đề 7: Thông báo & Huy hiệu
+  badges: ^3.1.2
+
+  # Chủ đề 9: Định vị toạ độ GPS salon
+  geolocator: ^13.0.1
+
+  # Định dạng ngày giờ
+  intl: ^0.19.0
+  supabase_flutter: ^2.18.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
