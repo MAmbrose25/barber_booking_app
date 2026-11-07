@@ -1,3 +1,4 @@
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_easyloading/flutter_easyloading.dart';
@@ -5,6 +6,8 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../theme/app_theme.dart';
+import '../utils/booking_utils.dart';
+import 'edit_profile_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -24,6 +27,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   String _fullName = '';
   String _email = '';
+  String _phone = '';
+  String? _avatarUrl;
 
   @override
   void initState() {
@@ -37,22 +42,42 @@ class _ProfileScreenState extends State<ProfileScreen> {
     _loadBookings();
   }
 
-  // Lấy họ tên từ bảng profiles
+  // Lấy họ tên, số điện thoại, ảnh đại diện từ bảng profiles
   Future<void> _loadProfile() async {
     final user = _client.auth.currentUser;
     if (user == null) return;
     try {
       final data = await _client
           .from('profiles')
-          .select('full_name')
+          .select('full_name, phone, avatar_url')
           .eq('id', user.id)
           .maybeSingle();
-      final name = (data?['full_name'] as String?)?.trim() ?? '';
-      if (!mounted || name.isEmpty) return;
-      setState(() => _fullName = name);
+      if (!mounted || data == null) return;
+      final name = (data['full_name'] as String?)?.trim() ?? '';
+      final avatar = (data['avatar_url'] as String?)?.trim() ?? '';
+      setState(() {
+        if (name.isNotEmpty) _fullName = name;
+        _phone = (data['phone'] as String?)?.trim() ?? '';
+        _avatarUrl = avatar.isEmpty ? null : avatar;
+      });
     } catch (_) {
-      // Không lấy được thì giữ tên tạm, không cần báo lỗi
+      // Không lấy được thì giữ thông tin tạm, không cần báo lỗi
     }
+  }
+
+  // Mở màn sửa hồ sơ, lưu xong thì tải lại thông tin
+  Future<void> _editProfile() async {
+    final changed = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => EditProfileScreen(
+          initialName: _fullName,
+          initialPhone: _phone,
+          initialAvatarUrl: _avatarUrl,
+        ),
+      ),
+    );
+    if (changed == true) _loadProfile();
   }
 
   // Lấy lịch hẹn của người đang đăng nhập, mới nhất lên đầu
@@ -63,6 +88,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
       return;
     }
     try {
+      // Chuyển các lịch đã qua giờ kết thúc sang 'completed' trong database
+      try {
+        await _client.rpc('complete_past_bookings');
+      } catch (_) {
+        // Lỗi ở bước này không được chặn việc hiển thị danh sách lịch
+      }
       final data = await _client
           .from('bookings')
           .select()
@@ -112,17 +143,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
   }
 
-  // Thời điểm bắt đầu của lịch hẹn
-  DateTime _bookingDateTime(Map<String, dynamic> booking) {
-    final d = (booking['booking_date'] as String).split('-');
-    final t = (booking['booking_time'] as String).split(':');
-    return DateTime(int.parse(d[0]), int.parse(d[1]), int.parse(d[2]),
-        int.parse(t[0]), int.parse(t[1]));
-  }
+  DateTime _startOf(Map<String, dynamic> booking) => bookingStart(
+      booking['booking_date'] as String, booking['booking_time'] as String);
 
   bool _canCancel(Map<String, dynamic> booking) =>
-      booking['status'] == 'booked' &&
-      _bookingDateTime(booking).isAfter(DateTime.now());
+      booking['status'] == 'booked' && _startOf(booking).isAfter(DateTime.now());
 
   Future<void> _cancelBooking(Map<String, dynamic> booking) async {
     final confirmed = await showDialog<bool>(
@@ -131,7 +156,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
         title: const Text('Hủy lịch hẹn?'),
         content: Text(
             'Bạn muốn hủy lịch "${booking['service_name']}" lúc '
-            '${booking['booking_time']} ngày ${_formatDate(booking['booking_date'])}?'),
+            '${shortTime(booking['booking_time'] as String)} ngày '
+            '${formatDbDate(booking['booking_date'] as String)}?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
@@ -159,20 +185,69 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
   }
 
-  // 2026-10-30 -> 30/10/2026
-  String _formatDate(String dbDate) {
-    final p = dbDate.split('-');
-    return '${p[2]}/${p[1]}/${p[0]}';
-  }
+  // Đánh giá thợ sau khi lịch đã hoàn thành
+  Future<void> _reviewBooking(Map<String, dynamic> booking) async {
+    int rating = 5;
+    String comment = '';
+    final barberName = booking['barber_name'] as String?;
 
-  String _formatPrice(int price) {
-    final s = price.toString();
-    final buffer = StringBuffer();
-    for (int i = 0; i < s.length; i++) {
-      if (i > 0 && (s.length - i) % 3 == 0) buffer.write('.');
-      buffer.write(s[i]);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(barberName == null || barberName.isEmpty
+              ? 'Đánh giá buổi hẹn'
+              : 'Đánh giá thợ $barberName'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(
+                  5,
+                  (i) => IconButton(
+                    padding: EdgeInsets.zero,
+                    icon: Icon(i < rating ? Icons.star : Icons.star_border,
+                        color: Colors.amber, size: 34),
+                    onPressed: () => setDialogState(() => rating = i + 1),
+                  ),
+                ),
+              ),
+              TextField(
+                maxLines: 2,
+                onChanged: (value) => comment = value,
+                decoration: const InputDecoration(
+                    hintText: 'Nhận xét (không bắt buộc)'),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Để sau'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Gửi'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (confirmed != true) return;
+
+    EasyLoading.show(status: 'Đang gửi đánh giá...');
+    try {
+      final text = comment.trim();
+      await _client.from('bookings').update({
+        'rating': rating,
+        'review_comment': text.isEmpty ? null : text,
+      }).eq('id', booking['id']);
+      await _loadBookings();
+      EasyLoading.showSuccess('Cảm ơn bạn đã đánh giá!');
+    } catch (_) {
+      EasyLoading.showError('Không gửi được đánh giá, vui lòng thử lại.');
     }
-    return buffer.toString();
   }
 
   Future<void> _makePhoneCall(String phoneNumber) async {
@@ -232,6 +307,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         _bookings.where((b) => b['status'] != 'cancelled').length;
     final initial =
         _fullName.isNotEmpty ? _fullName.substring(0, 1).toUpperCase() : '?';
+    final avatarUrl = _avatarUrl;
 
     return Scaffold(
       appBar: AppBar(
@@ -248,14 +324,19 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   CircleAvatar(
                     radius: 36,
                     backgroundColor: AppColors.button(context),
-                    child: Text(
-                      initial,
-                      style: const TextStyle(
-                        fontSize: 30,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.amberAccent,
-                      ),
-                    ),
+                    backgroundImage: avatarUrl == null
+                        ? null
+                        : CachedNetworkImageProvider(avatarUrl),
+                    child: avatarUrl == null
+                        ? Text(
+                            initial,
+                            style: const TextStyle(
+                              fontSize: 30,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.amberAccent,
+                            ),
+                          )
+                        : null,
                   ),
                   const SizedBox(width: 16),
                   Expanded(
@@ -276,6 +357,15 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(color: AppColors.muted(context)),
                         ),
+                        if (_phone.isNotEmpty) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            'SĐT: $_phone',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(color: AppColors.muted(context)),
+                          ),
+                        ],
                         const SizedBox(height: 6),
                         Text(
                           'Đã đặt $bookedCount lịch',
@@ -284,6 +374,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         ),
                       ],
                     ),
+                  ),
+                  IconButton(
+                    tooltip: 'Sửa hồ sơ',
+                    icon: Icon(Icons.edit, color: AppColors.title(context)),
+                    onPressed: _editProfile,
                   ),
                 ],
               ),
@@ -389,8 +484,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Widget _bookingTile(Map<String, dynamic> booking) {
-    final cancelled = booking['status'] == 'cancelled';
-    final upcoming = !cancelled && _bookingDateTime(booking).isAfter(DateTime.now());
+    final status = booking['status'] as String?;
+    final cancelled = status == 'cancelled';
+    final completed = status == 'completed';
 
     final IconData icon;
     final Color color;
@@ -399,26 +495,48 @@ class _ProfileScreenState extends State<ProfileScreen> {
       icon = Icons.close;
       color = Colors.redAccent;
       statusText = 'Đã hủy';
-    } else if (upcoming) {
+    } else if (completed) {
+      icon = Icons.check;
+      color = Colors.green;
+      statusText = 'Hoàn thành';
+    } else if (_startOf(booking).isAfter(DateTime.now())) {
       icon = Icons.schedule;
       color = Colors.orange;
       statusText = 'Sắp tới';
     } else {
-      icon = Icons.check;
-      color = Colors.green;
-      statusText = 'Hoàn thành';
+      // Đã tới giờ hẹn nhưng chưa tới giờ kết thúc
+      icon = Icons.timelapse;
+      color = Colors.blue;
+      statusText = 'Đang thực hiện';
     }
 
     // Ghép các dòng mô tả, dòng nào không có dữ liệu thì bỏ qua
     final barberName = booking['barber_name'] as String?;
     final hairstyleName = booking['hairstyle_name'] as String?;
+    final rating = booking['rating'] as int?;
     final lines = <String>[
-      '${_formatDate(booking['booking_date'])} • ${booking['booking_time']}',
+      '${formatDbDate(booking['booking_date'] as String)} • '
+          '${shortTime(booking['booking_time'] as String)}',
       if (barberName != null && barberName.isNotEmpty) 'Thợ: $barberName',
       if (hairstyleName != null && hairstyleName.isNotEmpty)
         'Kiểu tóc: $hairstyleName',
-      '${_formatPrice(booking['price'] as int)} đ • $statusText',
+      '${formatPrice(booking['price'] as int)} đ • $statusText',
+      if (rating != null) 'Bạn đã đánh giá: $rating/5 ★',
     ];
+
+    Widget? trailing;
+    if (_canCancel(booking)) {
+      trailing = TextButton(
+        onPressed: () => _cancelBooking(booking),
+        child: const Text('Hủy', style: TextStyle(color: Colors.redAccent)),
+      );
+    } else if (completed && rating == null) {
+      trailing = TextButton(
+        onPressed: () => _reviewBooking(booking),
+        child: Text('Đánh giá',
+            style: TextStyle(color: AppColors.title(context))),
+      );
+    }
 
     return Column(
       children: [
@@ -436,13 +554,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
             ),
           ),
           subtitle: Text(lines.join('\n')),
-          trailing: _canCancel(booking)
-              ? TextButton(
-                  onPressed: () => _cancelBooking(booking),
-                  child: const Text('Hủy',
-                      style: TextStyle(color: Colors.redAccent)),
-                )
-              : null,
+          trailing: trailing,
         ),
         const Divider(height: 1),
       ],

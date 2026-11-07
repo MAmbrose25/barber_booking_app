@@ -2,33 +2,28 @@ class Barber {
   final String id;
   final String name;
   final String role;
-  final double rating;
   final String avatarUrl;
+  final double? rating; // null nghĩa là chưa có ai đánh giá
+  final int reviewCount;
 
-  Barber({
+  const Barber({
     required this.id,
     required this.name,
     required this.role,
-    required this.rating,
     required this.avatarUrl,
+    this.rating,
+    this.reviewCount = 0,
   });
-}
 
-final List<Barber> sampleBarbers = [
-  Barber(
-    id: '1',
-    name: 'Alex Nguyễn',
-    role: 'Master Barber',
-    rating: 4.9,
-    avatarUrl:
-        'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400',
-  ),
-  Barber(
-    id: '2',
-    name: 'Hoàng Trần',
-    role: 'Top Stylist',
-    rating: 4.8,
-    avatarUrl:
-        'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400',
-  ),
-];
+  factory Barber.fromMap(Map<String, dynamic> map,
+      {Map<String, dynamic>? ratingRow}) {
+    return Barber(
+      id: map['id'] as String,
+      name: map['name'] as String,
+      role: map['role'] as String,
+      avatarUrl: map['avatar_url'] as String,
+      rating: (ratingRow?['avg_rating'] as num?)?.toDouble(),
+      reviewCount: (ratingRow?['review_count'] as num?)?.toInt() ?? 0,
+    );
+  }
+}

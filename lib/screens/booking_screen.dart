@@ -5,10 +5,12 @@ import 'package:flutter_animate/flutter_animate.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:table_calendar/table_calendar.dart';
 
+import '../data/catalog_repository.dart';
 import '../models/barber_model.dart';
 import '../models/hairstyle_model.dart';
 import '../models/service_model.dart';
 import '../theme/app_theme.dart';
+import '../utils/booking_utils.dart';
 
 class BookingScreen extends StatefulWidget {
   const BookingScreen({super.key});
@@ -20,28 +22,80 @@ class BookingScreen extends StatefulWidget {
 class _BookingScreenState extends State<BookingScreen> {
   final _client = Supabase.instance.client;
 
+  // Danh mục lấy từ Supabase
+  List<Barber> _barbers = [];
+  List<BarberService> _services = [];
+  List<Hairstyle> _hairstyles = [];
+  bool _loadingCatalog = true;
+  bool _catalogError = false;
+
   DateTime _focusedDay = DateTime.now();
   DateTime? _selectedDay;
   String? _selectedTime;
-  String _selectedBarberId = sampleBarbers.first.id;
+  String? _selectedBarberId;
   String? _selectedHairstyleId; // không bắt buộc, bấm lần nữa để bỏ chọn
-  String? _selectedServiceId = '1';
+  String? _selectedServiceId;
   String _paymentMethod = 'MOMO';
-  Set<String> _bookedSlots = {};
+
+  // Các khoảng thời gian đã có người đặt của thợ trong ngày, tính bằng phút từ 0h
+  List<(int, int)> _busy = [];
 
   final List<String> _timeSlots = const [
     '08:30', '09:30', '10:30', '13:30', '14:30', '15:30', '16:30', '17:30',
   ];
 
-  // Định dạng 100000 -> 100.000
-  String _formatPrice(int price) {
-    final s = price.toString();
-    final buffer = StringBuffer();
-    for (int i = 0; i < s.length; i++) {
-      if (i > 0 && (s.length - i) % 3 == 0) buffer.write('.');
-      buffer.write(s[i]);
+  // Salon đóng cửa lúc 19:00, dịch vụ không được kéo dài quá giờ này
+  static const int _closeMinutes = 19 * 60;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadCatalog();
+  }
+
+  Future<void> _loadCatalog() async {
+    try {
+      final barbers = await CatalogRepository.fetchBarbers();
+      final services = await CatalogRepository.fetchServices();
+      final hairstyles = await CatalogRepository.fetchHairstyles();
+      if (!mounted) return;
+      setState(() {
+        _barbers = barbers;
+        _services = services;
+        _hairstyles = hairstyles;
+        _selectedBarberId ??= barbers.isNotEmpty ? barbers.first.id : null;
+        _selectedServiceId ??= services.isNotEmpty ? services.first.id : null;
+        _loadingCatalog = false;
+        _catalogError = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _loadingCatalog = false;
+        _catalogError = true;
+      });
     }
-    return buffer.toString();
+  }
+
+  BarberService? get _selectedService {
+    for (final s in _services) {
+      if (s.id == _selectedServiceId) return s;
+    }
+    return null;
+  }
+
+  Barber? get _selectedBarber {
+    for (final b in _barbers) {
+      if (b.id == _selectedBarberId) return b;
+    }
+    return null;
+  }
+
+  Hairstyle? get _selectedHairstyle {
+    for (final h in _hairstyles) {
+      if (h.id == _selectedHairstyleId) return h;
+    }
+    return null;
   }
 
   String _dateToDb(DateTime day) =>
@@ -57,13 +111,25 @@ class _BookingScreenState extends State<BookingScreen> {
     return slot.isBefore(DateTime.now());
   }
 
-  // Tải các giờ đã có người đặt của thợ đang chọn trong ngày
+  // Khung giờ bị khóa nếu đã qua, vượt giờ đóng cửa, hoặc đụng lịch khác của thợ
+  // (tính theo thời lượng của gói dịch vụ đang chọn)
+  bool _isSlotDisabled(String time) {
+    if (_isPastSlot(time)) return true;
+    final duration = _selectedService?.durationMinutes ?? 60;
+    final start = minutesOfDay(time);
+    final end = start + duration;
+    if (end > _closeMinutes) return true;
+    return _busy.any((b) => start < b.$2 && end > b.$1);
+  }
+
+  // Tải các lịch đã có của thợ đang chọn trong ngày
   Future<void> _loadBookedSlots(DateTime day) async {
     final barberId = _selectedBarberId;
+    if (barberId == null) return;
     try {
       final data = await _client
           .from('bookings')
-          .select('booking_time')
+          .select('booking_time, duration_minutes')
           .eq('booking_date', _dateToDb(day))
           .eq('barber_id', barberId)
           .neq('status', 'cancelled'); // lịch đã hủy thì giờ đó trống lại
@@ -74,8 +140,11 @@ class _BookingScreenState extends State<BookingScreen> {
         return;
       }
       setState(() {
-        _bookedSlots =
-            data.map<String>((row) => row['booking_time'] as String).toSet();
+        _busy = data.map<(int, int)>((row) {
+          final start = minutesOfDay(row['booking_time'] as String);
+          final duration = (row['duration_minutes'] as num?)?.toInt() ?? 60;
+          return (start, start + duration);
+        }).toList();
       });
     } catch (_) {
       EasyLoading.showError('Không tải được các khung giờ đã đặt.');
@@ -87,33 +156,35 @@ class _BookingScreenState extends State<BookingScreen> {
     setState(() {
       _selectedBarberId = barber.id;
       _selectedTime = null;
-      _bookedSlots = {};
+      _busy = [];
     });
     if (_selectedDay != null) _loadBookedSlots(_selectedDay!);
   }
 
+  // Đổi gói dịch vụ có thể làm khung giờ đang chọn không còn đủ thời gian
+  void _selectService(BarberService service) {
+    final hadTime = _selectedTime != null;
+    setState(() {
+      _selectedServiceId = service.id;
+      final time = _selectedTime;
+      if (time != null && _isSlotDisabled(time)) _selectedTime = null;
+    });
+    if (hadTime && _selectedTime == null) {
+      EasyLoading.showInfo('Gói này cần nhiều thời gian hơn, hãy chọn lại giờ.');
+    }
+  }
+
   Future<void> _confirmBooking() async {
-    if (_selectedDay == null ||
-        _selectedTime == null ||
-        _selectedServiceId == null) {
-      EasyLoading.showError('Vui lòng chọn ngày, giờ và gói dịch vụ.');
+    final day = _selectedDay;
+    final time = _selectedTime;
+    final service = _selectedService;
+    final barber = _selectedBarber;
+    if (day == null || time == null || service == null || barber == null) {
+      EasyLoading.showError('Vui lòng chọn thợ, ngày, giờ và gói dịch vụ.');
       return;
     }
 
-    final service = sampleServices.firstWhere(
-      (item) => item.id == _selectedServiceId,
-      orElse: () => sampleServices.first,
-    );
-    final barber = sampleBarbers.firstWhere(
-      (item) => item.id == _selectedBarberId,
-      orElse: () => sampleBarbers.first,
-    );
-    Hairstyle? hairstyle;
-    for (final style in sampleHairstyles) {
-      if (style.id == _selectedHairstyleId) hairstyle = style;
-    }
-    final day = _selectedDay!;
-    final time = _selectedTime!;
+    final hairstyle = _selectedHairstyle;
     final date = '${day.day.toString().padLeft(2, '0')}/'
         '${day.month.toString().padLeft(2, '0')}/${day.year}';
     final paymentLabel = switch (_paymentMethod) {
@@ -127,6 +198,7 @@ class _BookingScreenState extends State<BookingScreen> {
       await _client.from('bookings').insert({
         'booking_date': _dateToDb(day),
         'booking_time': time,
+        'duration_minutes': service.durationMinutes,
         'barber_id': barber.id,
         'barber_name': barber.name,
         'hairstyle_name': hairstyle?.name,
@@ -147,10 +219,11 @@ class _BookingScreenState extends State<BookingScreen> {
         builder: (dialogContext) => AlertDialog(
           title: const Text('Đặt lịch thành công'),
           content: Text(
-            'Ngày: $date\nGiờ: $time\nThợ: ${barber.name}\n'
+            'Ngày: $date\nGiờ: $time (${service.durationLabel})\n'
+            'Thợ: ${barber.name}\n'
             'Kiểu tóc: ${hairstyle?.name ?? 'Tư vấn tại salon'}\n'
             'Dịch vụ: ${service.name}\n'
-            'Giá: ${_formatPrice(service.price)} đ\nThanh toán: $paymentLabel\n\n'
+            'Giá: ${formatPrice(service.price)} đ\nThanh toán: $paymentLabel\n\n'
             'Lịch hẹn đã được lưu, bạn xem và hủy lịch trong mục Tài khoản. '
             'Phần thanh toán MoMo/VNPay chỉ là demo, chưa có giao dịch thật.',
           ),
@@ -163,8 +236,8 @@ class _BookingScreenState extends State<BookingScreen> {
         ),
       );
     } on PostgrestException catch (e) {
-      // 23505 = vi phạm unique, tức là thợ này vừa có người đặt khung giờ đó
-      if (e.code == '23505') {
+      // 23505 = trùng đúng giờ bắt đầu, 23P01 = thời gian bị chồng với lịch khác của thợ
+      if (e.code == '23505' || e.code == '23P01') {
         EasyLoading.showError('Khung giờ này vừa có người đặt, hãy chọn giờ khác.');
         await _loadBookedSlots(day);
         if (mounted) setState(() => _selectedTime = null);
@@ -178,193 +251,227 @@ class _BookingScreenState extends State<BookingScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final selectedService = sampleServices.firstWhere(
-      (service) => service.id == _selectedServiceId,
-      orElse: () => sampleServices.first,
-    );
-    final isDark = AppColors.isDark(context);
-    final textColor = Theme.of(context).colorScheme.onSurface;
-    final mutedColor = AppColors.muted(context);
+    Widget body;
+    if (_loadingCatalog) {
+      body = const Center(child: CircularProgressIndicator());
+    } else if (_catalogError) {
+      body = Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Không tải được dữ liệu đặt lịch.'),
+            TextButton(
+              onPressed: () {
+                setState(() {
+                  _loadingCatalog = true;
+                  _catalogError = false;
+                });
+                _loadCatalog();
+              },
+              child: const Text('Thử lại'),
+            ),
+          ],
+        ),
+      );
+    } else {
+      body = _buildForm(context);
+    }
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('ĐẶT LỊCH & THANH TOÁN',
             style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17)),
       ),
-      body: SingleChildScrollView(
-        physics: const BouncingScrollPhysics(),
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _sectionTitle('1. Chọn thợ cắt tóc'),
-            const SizedBox(height: 10),
-            SizedBox(
-              height: 180,
-              child: ListView.builder(
-                scrollDirection: Axis.horizontal,
-                itemCount: sampleBarbers.length,
-                itemBuilder: (context, index) =>
-                    _barberCard(sampleBarbers[index]),
+      body: body,
+    );
+  }
+
+  Widget _buildForm(BuildContext context) {
+    final selectedService = _selectedService;
+    final isDark = AppColors.isDark(context);
+    final textColor = Theme.of(context).colorScheme.onSurface;
+    final mutedColor = AppColors.muted(context);
+
+    return SingleChildScrollView(
+      physics: const BouncingScrollPhysics(),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _sectionTitle('1. Chọn thợ cắt tóc'),
+          const SizedBox(height: 10),
+          SizedBox(
+            height: 180,
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              itemCount: _barbers.length,
+              itemBuilder: (context, index) => _barberCard(_barbers[index]),
+            ),
+          ),
+          const SizedBox(height: 16),
+          _sectionTitle('2. Chọn ngày cắt tóc'),
+          const SizedBox(height: 8),
+          Container(
+            decoration: BoxDecoration(
+              color: AppColors.card(context),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: TableCalendar(
+              firstDay: DateUtils.dateOnly(DateTime.now()),
+              lastDay: DateUtils.dateOnly(
+                  DateTime.now().add(const Duration(days: 30))),
+              focusedDay: _focusedDay,
+              calendarFormat: CalendarFormat.twoWeeks,
+              selectedDayPredicate: (day) => isSameDay(_selectedDay, day),
+              onDaySelected: (selectedDay, focusedDay) {
+                setState(() {
+                  _selectedDay = selectedDay;
+                  _focusedDay = focusedDay;
+                  _selectedTime = null;
+                  _busy = [];
+                });
+                _loadBookedSlots(selectedDay);
+              },
+              headerStyle: HeaderStyle(
+                formatButtonVisible: false,
+                titleCentered: true,
+                titleTextStyle: TextStyle(fontSize: 17, color: textColor),
+                leftChevronIcon: Icon(Icons.chevron_left, color: textColor),
+                rightChevronIcon: Icon(Icons.chevron_right, color: textColor),
+              ),
+              daysOfWeekStyle: DaysOfWeekStyle(
+                weekdayStyle: TextStyle(color: textColor),
+                weekendStyle: TextStyle(color: mutedColor),
+              ),
+              calendarStyle: CalendarStyle(
+                defaultTextStyle: TextStyle(color: textColor),
+                weekendTextStyle: TextStyle(color: mutedColor),
+                todayDecoration: BoxDecoration(
+                    color:
+                        isDark ? Colors.brown.shade700 : Colors.brown.shade200,
+                    shape: BoxShape.circle),
+                selectedDecoration: BoxDecoration(
+                    color: AppColors.button(context), shape: BoxShape.circle),
+                selectedTextStyle: const TextStyle(
+                    color: Colors.amber, fontWeight: FontWeight.bold),
               ),
             ),
-            const SizedBox(height: 16),
-            _sectionTitle('2. Chọn ngày cắt tóc'),
-            const SizedBox(height: 8),
-            Container(
-              decoration: BoxDecoration(
-                color: AppColors.card(context),
-                borderRadius: BorderRadius.circular(16),
-              ),
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              child: TableCalendar(
-                firstDay: DateUtils.dateOnly(DateTime.now()),
-                lastDay: DateUtils.dateOnly(
-                    DateTime.now().add(const Duration(days: 30))),
-                focusedDay: _focusedDay,
-                calendarFormat: CalendarFormat.twoWeeks,
-                selectedDayPredicate: (day) => isSameDay(_selectedDay, day),
-                onDaySelected: (selectedDay, focusedDay) {
-                  setState(() {
-                    _selectedDay = selectedDay;
-                    _focusedDay = focusedDay;
-                    _selectedTime = null;
-                    _bookedSlots = {};
-                  });
-                  _loadBookedSlots(selectedDay);
-                },
-                headerStyle: HeaderStyle(
-                  formatButtonVisible: false,
-                  titleCentered: true,
-                  titleTextStyle: TextStyle(fontSize: 17, color: textColor),
-                  leftChevronIcon:
-                      Icon(Icons.chevron_left, color: textColor),
-                  rightChevronIcon:
-                      Icon(Icons.chevron_right, color: textColor),
+          ).animate().fadeIn(),
+          const SizedBox(height: 20),
+          _sectionTitle('3. Chọn khung giờ trống'),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: _timeSlots.map((time) {
+              final isSelected = _selectedTime == time;
+              final isDisabled = _isSlotDisabled(time);
+              return ChoiceChip(
+                label: Text(time),
+                selected: isSelected,
+                selectedColor: AppColors.button(context),
+                labelStyle: TextStyle(
+                  color: isDisabled
+                      ? Colors.grey
+                      : (isSelected ? Colors.amberAccent : textColor),
+                  decoration: isDisabled ? TextDecoration.lineThrough : null,
                 ),
-                daysOfWeekStyle: DaysOfWeekStyle(
-                  weekdayStyle: TextStyle(color: textColor),
-                  weekendStyle: TextStyle(color: mutedColor),
-                ),
-                calendarStyle: CalendarStyle(
-                  defaultTextStyle: TextStyle(color: textColor),
-                  weekendTextStyle: TextStyle(color: mutedColor),
-                  todayDecoration: BoxDecoration(
-                      color: isDark
-                          ? Colors.brown.shade700
-                          : Colors.brown.shade200,
-                      shape: BoxShape.circle),
-                  selectedDecoration: BoxDecoration(
-                      color: AppColors.button(context), shape: BoxShape.circle),
-                  selectedTextStyle: const TextStyle(
-                      color: Colors.amber, fontWeight: FontWeight.bold),
-                ),
-              ),
-            ).animate().fadeIn(),
-            const SizedBox(height: 20),
-            _sectionTitle('3. Chọn khung giờ trống'),
-            const SizedBox(height: 10),
-            Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              children: _timeSlots.map((time) {
-                final isSelected = _selectedTime == time;
-                final isDisabled = _bookedSlots.contains(time) || _isPastSlot(time);
-                return ChoiceChip(
-                  label: Text(time),
-                  selected: isSelected,
-                  selectedColor: AppColors.button(context),
-                  labelStyle: TextStyle(
-                    color: isDisabled
-                        ? Colors.grey
-                        : (isSelected ? Colors.amberAccent : textColor),
-                    decoration: isDisabled ? TextDecoration.lineThrough : null,
-                  ),
-                  onSelected: isDisabled
-                      ? null
-                      : (_) => setState(() => _selectedTime = time),
-                );
-              }).toList(),
-            ),
-            const SizedBox(height: 24),
-            _sectionTitle('4. Chọn kiểu tóc (không bắt buộc)'),
-            const SizedBox(height: 10),
-            SizedBox(
-              height: 160,
-              child: ListView.builder(
-                scrollDirection: Axis.horizontal,
-                itemCount: sampleHairstyles.length,
-                itemBuilder: (context, index) =>
-                    _hairstyleCard(sampleHairstyles[index]),
-              ),
-            ),
-            const SizedBox(height: 24),
-            _sectionTitle('5. Chọn gói dịch vụ'),
-            const SizedBox(height: 10),
-            ...sampleServices.map((service) {
-              final isSelected = _selectedServiceId == service.id;
-              return Card(
-                color: AppColors.card(context),
-                margin: const EdgeInsets.only(bottom: 10),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                  side: BorderSide(
-                    color: isSelected
-                        ? AppColors.title(context)
-                        : Colors.transparent,
-                    width: 2,
-                  ),
-                ),
-                child: ListTile(
-                  leading: Icon(
-                    isSelected
-                        ? Icons.check_circle
-                        : Icons.radio_button_unchecked,
-                    color: isSelected ? AppColors.title(context) : Colors.grey,
-                  ),
-                  title: Text(service.name,
-                      style: const TextStyle(fontWeight: FontWeight.bold)),
-                  subtitle: Text('Thời lượng: ${service.duration}'),
-                  trailing: Text('${_formatPrice(service.price)} đ',
-                      style: const TextStyle(
-                          fontWeight: FontWeight.bold,
-                          color: Colors.deepOrange)),
-                  onTap: () => setState(() => _selectedServiceId = service.id),
-                ),
+                onSelected: isDisabled
+                    ? null
+                    : (_) => setState(() => _selectedTime = time),
               );
-            }),
-            const SizedBox(height: 16),
-            _sectionTitle('6. Phương thức thanh toán'),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              children: [
-                _paymentChoice('MOMO', 'MoMo (demo)'),
-                _paymentChoice('VNPAY', 'VNPay (demo)'),
-                _paymentChoice('TIEN_MAT', 'Tại salon'),
-              ],
-            ),
-            const SizedBox(height: 24),
-            SizedBox(
-              width: double.infinity,
-              height: 52,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: AppColors.button(context),
-                  foregroundColor: Colors.amberAccent,
-                ),
-                onPressed: _confirmBooking,
-                child: Text('XÁC NHẬN (${_formatPrice(selectedService.price)} Đ)'),
+            }).toList(),
+          ),
+          if (selectedService != null && selectedService.durationMinutes > 60)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                'Gói "${selectedService.name}" kéo dài ${selectedService.durationLabel}, '
+                'nên các khung giờ vướng lịch khác của thợ sẽ bị gạch.',
+                style: TextStyle(fontSize: 12, color: mutedColor),
               ),
             ),
-          ],
-        ),
+          const SizedBox(height: 24),
+          _sectionTitle('4. Chọn kiểu tóc (không bắt buộc)'),
+          const SizedBox(height: 10),
+          SizedBox(
+            height: 160,
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              itemCount: _hairstyles.length,
+              itemBuilder: (context, index) =>
+                  _hairstyleCard(_hairstyles[index]),
+            ),
+          ),
+          const SizedBox(height: 24),
+          _sectionTitle('5. Chọn gói dịch vụ'),
+          const SizedBox(height: 10),
+          ..._services.map((service) {
+            final isSelected = _selectedServiceId == service.id;
+            return Card(
+              color: AppColors.card(context),
+              margin: const EdgeInsets.only(bottom: 10),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+                side: BorderSide(
+                  color: isSelected
+                      ? AppColors.title(context)
+                      : Colors.transparent,
+                  width: 2,
+                ),
+              ),
+              child: ListTile(
+                leading: Icon(
+                  isSelected
+                      ? Icons.check_circle
+                      : Icons.radio_button_unchecked,
+                  color: isSelected ? AppColors.title(context) : Colors.grey,
+                ),
+                title: Text(service.name,
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                subtitle: Text('Thời lượng: ${service.durationLabel}'),
+                trailing: Text('${formatPrice(service.price)} đ',
+                    style: const TextStyle(
+                        fontWeight: FontWeight.bold, color: Colors.deepOrange)),
+                onTap: () => _selectService(service),
+              ),
+            );
+          }),
+          const SizedBox(height: 16),
+          _sectionTitle('6. Phương thức thanh toán'),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            children: [
+              _paymentChoice('MOMO', 'MoMo (demo)'),
+              _paymentChoice('VNPAY', 'VNPay (demo)'),
+              _paymentChoice('TIEN_MAT', 'Tại salon'),
+            ],
+          ),
+          const SizedBox(height: 24),
+          SizedBox(
+            width: double.infinity,
+            height: 52,
+            child: ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.button(context),
+                foregroundColor: Colors.amberAccent,
+              ),
+              onPressed: _confirmBooking,
+              child: Text(selectedService == null
+                  ? 'XÁC NHẬN'
+                  : 'XÁC NHẬN (${formatPrice(selectedService.price)} Đ)'),
+            ),
+          ),
+        ],
       ),
     );
   }
 
   Widget _barberCard(Barber barber) {
     final isSelected = _selectedBarberId == barber.id;
+    final rating = barber.rating;
     return GestureDetector(
       onTap: () => _selectBarber(barber),
       child: Container(
@@ -404,10 +511,15 @@ class _BookingScreenState extends State<BookingScreen> {
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                const Icon(Icons.star, size: 14, color: Colors.amber),
+                Icon(rating == null ? Icons.star_border : Icons.star,
+                    size: 14, color: Colors.amber),
                 const SizedBox(width: 4),
-                Text(barber.rating.toString(),
-                    style: const TextStyle(fontSize: 12)),
+                Text(
+                  rating == null
+                      ? 'Mới'
+                      : '${rating.toStringAsFixed(1)} (${barber.reviewCount})',
+                  style: const TextStyle(fontSize: 12),
+                ),
               ],
             ),
           ],
@@ -420,8 +532,8 @@ class _BookingScreenState extends State<BookingScreen> {
     final isSelected = _selectedHairstyleId == style.id;
     return GestureDetector(
       // bấm vào kiểu đang chọn thì bỏ chọn
-      onTap: () => setState(
-          () => _selectedHairstyleId = isSelected ? null : style.id),
+      onTap: () =>
+          setState(() => _selectedHairstyleId = isSelected ? null : style.id),
       child: Container(
         width: 120,
         margin: const EdgeInsets.only(right: 12),

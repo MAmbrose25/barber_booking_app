@@ -4,11 +4,23 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:shimmer/shimmer.dart';
 import 'package:badges/badges.dart' as badges;
 import 'package:flutter_animate/flutter_animate.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../data/catalog_repository.dart';
+import '../models/hairstyle_model.dart';
 import '../theme/app_theme.dart';
+import '../utils/booking_utils.dart';
+import 'all_hairstyles_screen.dart';
 
-class HomeScreen extends StatelessWidget {
+class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final _client = Supabase.instance.client;
 
   final List<String> banners = const [
     'https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=800',
@@ -16,8 +28,66 @@ class HomeScreen extends StatelessWidget {
     'https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=800',
   ];
 
+  List<Hairstyle> _hairstyles = [];
+  bool _loadingHairstyles = true;
+  bool _hairstyleError = false;
+
+  // Lịch hẹn sắp tới của người dùng, dùng làm thông báo nhắc lịch
+  List<Map<String, dynamic>> _upcoming = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadHairstyles();
+    _loadUpcoming();
+  }
+
+  Future<void> _loadHairstyles() async {
+    try {
+      final data = await CatalogRepository.fetchHairstyles();
+      if (!mounted) return;
+      setState(() {
+        _hairstyles = data;
+        _loadingHairstyles = false;
+        _hairstyleError = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _loadingHairstyles = false;
+        _hairstyleError = true;
+      });
+    }
+  }
+
+  Future<void> _loadUpcoming() async {
+    final user = _client.auth.currentUser;
+    if (user == null) return;
+    try {
+      final data = await _client
+          .from('bookings')
+          .select('service_name, booking_date, booking_time, barber_name')
+          .eq('user_id', user.id)
+          .eq('status', 'booked')
+          .order('booking_date')
+          .order('booking_time');
+      final now = DateTime.now();
+      final upcoming = List<Map<String, dynamic>>.from(data)
+          .where((b) => bookingStart(
+                  b['booking_date'] as String, b['booking_time'] as String)
+              .isAfter(now))
+          .toList();
+      if (!mounted) return;
+      setState(() => _upcoming = upcoming);
+    } catch (_) {
+      // Không tải được thì để trống, không cần báo lỗi ở trang chủ
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final visibleHairstyles = _hairstyles.take(4).toList();
+
     return Scaffold(
       // Màu nền và màu AppBar lấy từ theme trong app_theme.dart
       appBar: AppBar(
@@ -35,9 +105,10 @@ class HomeScreen extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.only(right: 16.0),
             child: badges.Badge(
+              showBadge: _upcoming.isNotEmpty,
               position: badges.BadgePosition.topEnd(top: 2, end: 2),
-              badgeContent: const Text('1',
-                  style: TextStyle(color: Colors.white, fontSize: 10)),
+              badgeContent: Text('${_upcoming.length}',
+                  style: const TextStyle(color: Colors.white, fontSize: 10)),
               badgeStyle:
                   const badges.BadgeStyle(badgeColor: Colors.deepOrangeAccent),
               child: IconButton(
@@ -100,96 +171,91 @@ class HomeScreen extends StatelessWidget {
                         fontWeight: FontWeight.bold,
                         color: AppColors.title(context)),
                   ),
-                  Text('Xem tất cả',
-                      style: TextStyle(
-                          color: AppColors.title(context),
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600)),
+                  TextButton(
+                    style: TextButton.styleFrom(
+                      foregroundColor: AppColors.title(context),
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      minimumSize: const Size(0, 32),
+                    ),
+                    onPressed: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (_) => const AllHairstylesScreen()),
+                    ),
+                    child: const Text('Xem tất cả',
+                        style: TextStyle(
+                            fontSize: 13, fontWeight: FontWeight.w600)),
+                  ),
                 ],
               ),
             ),
             const SizedBox(height: 12),
 
-            // Lưới mẫu tóc dạng thẻ đổ bóng Card sạch đẹp
-            GridView.builder(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 2,
-                crossAxisSpacing: 14,
-                mainAxisSpacing: 14,
-                childAspectRatio: 0.85,
+            if (_hairstyleError)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Row(
+                  children: [
+                    Text('Không tải được mẫu tóc.',
+                        style: TextStyle(color: AppColors.muted(context))),
+                    TextButton(
+                      onPressed: () {
+                        setState(() {
+                          _loadingHairstyles = true;
+                          _hairstyleError = false;
+                        });
+                        _loadHairstyles();
+                      },
+                      child: const Text('Thử lại'),
+                    ),
+                  ],
+                ),
+              )
+            else if (!_loadingHairstyles && visibleHairstyles.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Text('Chưa có mẫu tóc nào.',
+                    style: TextStyle(color: AppColors.muted(context))),
+              )
+            else
+              // Lưới mẫu tóc lấy từ bảng hairstyles trên Supabase
+              GridView.builder(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: 2,
+                  crossAxisSpacing: 14,
+                  mainAxisSpacing: 14,
+                  childAspectRatio: 0.85,
+                ),
+                itemCount: _loadingHairstyles ? 4 : visibleHairstyles.length,
+                itemBuilder: (context, index) {
+                  final Widget tile = _loadingHairstyles
+                      ? _skeletonTile(context)
+                      : HairstyleTile(style: visibleHairstyles[index]);
+                  return tile
+                      .animate()
+                      .fadeIn(delay: (100 * index).ms)
+                      .scale(begin: const Offset(0.95, 0.95));
+                },
               ),
-              itemCount: 4,
-              itemBuilder: (context, index) {
-                return Container(
-                  decoration: BoxDecoration(
-                    color: AppColors.card(context),
-                    borderRadius: BorderRadius.circular(14),
-                    boxShadow: [
-                      BoxShadow(
-                        // ignore: deprecated_member_use
-                        color: Colors.brown.withOpacity(0.08),
-                        blurRadius: 10,
-                        offset: const Offset(0, 4),
-                      ),
-                    ],
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Expanded(
-                        child: ClipRRect(
-                          borderRadius: const BorderRadius.vertical(
-                              top: Radius.circular(14)),
-                          child: CachedNetworkImage(
-                            imageUrl: banners[index % banners.length],
-                            fit: BoxFit.cover,
-                            width: double.infinity,
-                            // Hiệu ứng Shimmer cho từng ô ảnh
-                            placeholder: (context, url) => Shimmer.fromColors(
-                              baseColor: AppColors.shimmerBase(context),
-                              highlightColor: AppColors.shimmerHighlight(context),
-                              child: Container(color: Colors.white),
-                            ),
-                          ),
-                        ),
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.all(10.0),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Kiểu Fade Master ${index + 1}',
-                              style: TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 14,
-                                  color: AppColors.title(context)),
-                            ),
-                            const SizedBox(height: 4),
-                            Text('Thời thượng • Lịch lãm',
-                                style: TextStyle(
-                                    fontSize: 11,
-                                    color: AppColors.muted(context))),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                )
-                    .animate()
-                    .fadeIn(delay: (100 * index).ms)
-                    .scale(begin: const Offset(0.95, 0.95));
-              },
-            ),
             const SizedBox(height: 20),
           ],
         ),
       ),
     );
   }
+
+  // Ô giữ chỗ trong lúc đang tải danh sách kiểu tóc
+  Widget _skeletonTile(BuildContext context) => ClipRRect(
+        borderRadius: BorderRadius.circular(14),
+        child: Shimmer.fromColors(
+          baseColor: AppColors.shimmerBase(context),
+          highlightColor: AppColors.shimmerHighlight(context),
+          child: Container(color: Colors.white),
+        ),
+      );
 
   void _showNotifications(BuildContext context) {
     showModalBottomSheet<void>(
@@ -206,21 +272,37 @@ class HomeScreen extends StatelessWidget {
               const Text('Thông báo',
                   style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
               const SizedBox(height: 12),
-              const ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: Icon(Icons.local_offer, color: Colors.deepOrange),
-                title: Text('Ưu đãi tại Classic Barber Shop'),
-                subtitle: Text('Đặt lịch ngay để trải nghiệm các dịch vụ mới.'),
-              ),
-              const Divider(),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: Icon(Icons.calendar_month,
-                    color: AppColors.title(sheetContext)),
-                title: const Text('Đặt lịch thuận tiện'),
-                subtitle:
-                    const Text('Chọn ngày và giờ phù hợp trong mục Đặt lịch.'),
-              ),
+              if (_upcoming.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Text('Chưa có thông báo mới.',
+                      style: TextStyle(color: AppColors.muted(sheetContext))),
+                )
+              else
+                Flexible(
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: _upcoming.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (_, index) {
+                      final b = _upcoming[index];
+                      final barberName = b['barber_name'] as String?;
+                      final hasBarber =
+                          barberName != null && barberName.isNotEmpty;
+                      return ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.calendar_month,
+                            color: AppColors.title(sheetContext)),
+                        title: Text('Lịch hẹn sắp tới: ${b['service_name']}'),
+                        subtitle: Text(
+                          '${shortTime(b['booking_time'] as String)} ngày '
+                          '${formatDbDate(b['booking_date'] as String)}'
+                          '${hasBarber ? ' • Thợ: $barberName' : ''}',
+                        ),
+                      );
+                    },
+                  ),
+                ),
             ],
           ),
         ),
