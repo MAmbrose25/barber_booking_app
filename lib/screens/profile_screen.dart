@@ -19,6 +19,11 @@ class ProfileScreen extends StatefulWidget {
 class _ProfileScreenState extends State<ProfileScreen> {
   static const double _salonLat = 10.7769;
   static const double _salonLng = 106.7009;
+
+  // true  = cho bấm "Hoàn thành" cả khi chưa tới giờ hẹn
+  // false = chỉ hiện nút này từ lúc tới giờ hẹn trở đi
+  static const bool _allowEarlyComplete = true;
+
   String _distanceInfo = 'Nhấn nút để kiểm tra khoảng cách';
 
   final _client = Supabase.instance.client;
@@ -149,6 +154,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
   bool _canCancel(Map<String, dynamic> booking) =>
       booking['status'] == 'booked' && _startOf(booking).isAfter(DateTime.now());
 
+  // Nút "Hoàn thành" chỉ hiện với lịch chưa hoàn thành và chưa hủy
+  bool _canComplete(Map<String, dynamic> booking) =>
+      booking['status'] == 'booked' &&
+      (_allowEarlyComplete || !_startOf(booking).isAfter(DateTime.now()));
+
   Future<void> _cancelBooking(Map<String, dynamic> booking) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -182,6 +192,43 @@ class _ProfileScreenState extends State<ProfileScreen> {
       EasyLoading.showSuccess('Đã hủy lịch hẹn.');
     } catch (_) {
       EasyLoading.showError('Không hủy được lịch, vui lòng thử lại.');
+    }
+  }
+
+  // Đánh dấu lịch hẹn đã hoàn thành
+  Future<void> _completeBooking(Map<String, dynamic> booking) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Đánh dấu hoàn thành?'),
+        content: Text(
+            'Xác nhận bạn đã hoàn thành dịch vụ "${booking['service_name']}" lúc '
+            '${shortTime(booking['booking_time'] as String)} ngày '
+            '${formatDbDate(booking['booking_date'] as String)}?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Chưa'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child:
+                const Text('Hoàn thành', style: TextStyle(color: Colors.green)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    EasyLoading.show(status: 'Đang cập nhật...');
+    try {
+      await _client
+          .from('bookings')
+          .update({'status': 'completed'}).eq('id', booking['id']);
+      await _loadBookings();
+      EasyLoading.showSuccess('Đã đánh dấu hoàn thành.');
+    } catch (_) {
+      EasyLoading.showError('Không cập nhật được, vui lòng thử lại.');
     }
   }
 
@@ -483,6 +530,13 @@ class _ProfileScreenState extends State<ProfileScreen> {
     );
   }
 
+  // Kiểu nút nhỏ gọn để xếp hai nút chồng lên nhau trong một dòng lịch
+  ButtonStyle get _compactButton => TextButton.styleFrom(
+        minimumSize: Size.zero,
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      );
+
   Widget _bookingTile(Map<String, dynamic> booking) {
     final status = booking['status'] as String?;
     final cancelled = status == 'cancelled';
@@ -524,14 +578,35 @@ class _ProfileScreenState extends State<ProfileScreen> {
       if (rating != null) 'Bạn đã đánh giá: $rating/5 ★',
     ];
 
+    final canComplete = _canComplete(booking);
+    final canCancel = _canCancel(booking);
+
     Widget? trailing;
-    if (_canCancel(booking)) {
-      trailing = TextButton(
-        onPressed: () => _cancelBooking(booking),
-        child: const Text('Hủy', style: TextStyle(color: Colors.redAccent)),
+    if (canComplete || canCancel) {
+      // Nút Hoàn thành nằm trên nút Hủy
+      trailing = Column(
+        mainAxisSize: MainAxisSize.min,
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          if (canComplete)
+            TextButton(
+              style: _compactButton,
+              onPressed: () => _completeBooking(booking),
+              child: const Text('Hoàn thành',
+                  style: TextStyle(color: Colors.green)),
+            ),
+          if (canCancel)
+            TextButton(
+              style: _compactButton,
+              onPressed: () => _cancelBooking(booking),
+              child:
+                  const Text('Hủy', style: TextStyle(color: Colors.redAccent)),
+            ),
+        ],
       );
     } else if (completed && rating == null) {
       trailing = TextButton(
+        style: _compactButton,
         onPressed: () => _reviewBooking(booking),
         child: Text('Đánh giá',
             style: TextStyle(color: AppColors.title(context))),
@@ -540,21 +615,44 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
     return Column(
       children: [
-        ListTile(
-          isThreeLine: true,
-          leading: CircleAvatar(
-            backgroundColor: AppColors.background(context),
-            child: Icon(icon, color: color),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              CircleAvatar(
+                backgroundColor: AppColors.background(context),
+                child: Icon(icon, color: color),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      booking['service_name'] as String,
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        decoration:
+                            cancelled ? TextDecoration.lineThrough : null,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(lines.join('\n')),
+                  ],
+                ),
+              ),
+              if (trailing != null) ...[
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Align(
+                    alignment: Alignment.topRight,
+                    child: trailing,
+                  ),
+                ),
+              ],
+            ],
           ),
-          title: Text(
-            booking['service_name'] as String,
-            style: TextStyle(
-              fontWeight: FontWeight.w600,
-              decoration: cancelled ? TextDecoration.lineThrough : null,
-            ),
-          ),
-          subtitle: Text(lines.join('\n')),
-          trailing: trailing,
         ),
         const Divider(height: 1),
       ],
