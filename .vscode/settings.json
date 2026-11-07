@@ -1,4 +1,10 @@
 {
     "files.autoSave": "afterDelay",
-    "cSpell.language": "en,vi"
+    "cSpell.language": "en,vi",
+    "cSpell.words": [
+        "khóa",
+        "MOMO",
+        "VNPAY",
+        "webp"
+    ]
 }
